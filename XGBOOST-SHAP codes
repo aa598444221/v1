@@ -1,0 +1,212 @@
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+XGBOOST-SHAP DIAGNOSTIC ATTRIBUTION FOR SALT MARSH CARBON FLUXES
+================================================================================
+Version: 1.2 (Academic Edition - Visual Geometry Fixed)
+Compatibility: Python 3.8, 3.9, 3.10+
+Execution Environment: Local (Terminal/IDE) or Cloud (Google Colab/Jupyter)
+--------------------------------------------------------------------------------
+
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!!!                          IMPORTANT NOTICE                                !!!
+!!!                                                                          !!!
+!!! THIS CODE INCLUDES A 'DUMMY DATA' FALLBACK MECHANISM. IF THE SCRIPT      !!!
+!!! CANNOT FIND YOUR '.txt' DATA FILES, IT WILL AUTOMATICALLY GENERATE       !!!
+!!! RANDOM DATA TO DEMONSTRATE THE PIPELINE.                                 !!!
+!!!                                                                          !!!
+!!! IF YOUR OUTPUT PLOTS LOOK RANDOM OR SENSELESS, IT IS LIKELY BECAUSE THE  !!!
+!!! SCRIPT IS RUNNING ON TEMPLATE DATA RATHER THAN YOUR ACTUAL OBSERVATIONS. !!!
+!!! PLEASE ENSURE YOUR 'data_spring.txt', etc., ARE IN THE CORRECT FOLDER.   !!!
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+[DATA ACCESSIBILITY AND POLICY COMPLIANCE]
+Due to institutional environmental data protection policies, the specific 
+time-series for driving factors (Air Temperature, TA; Tidal Height, TH) are 
+restricted from public redistribution. However, the carbon flux sequences 
+(NEE, FCH4, FDOC, FDIC) analyzed in this study are available at 
+[https://github.com/aa598444221/v1] for scientific verification.
+
+[DATA PREPARATION GUIDE]
+To replicate this diagnostic with YOUR OWN DATA, prepare three text files:
+'data_spring.txt', 'data_summer.txt', and 'data_autumn.txt'.
+
+1. File Structure: Header-less, space or comma-separated text files.
+2. Column Order (Strictly 6 Columns):
+   - Col 1: TA (Air Temperature, °C)
+   - Col 2: TH (Tidal Height, m)
+   - Col 3: NEE (Net Ecosystem Exchange, g C m⁻² s⁻¹)
+   - Col 4: FCH4 (Methane Flux, g C m⁻² s⁻¹)
+   - Col 5: FDOC (Dissolved Organic Carbon Flux, g C m⁻² s⁻¹)
+   - Col 6: FDIC (Dissolved Inorganic Carbon Flux, g C m⁻² s⁻¹)
+
+[HOW TO RUN THIS CODE]
+1. Environment Setup: 
+   $ pip install pandas numpy shap xgboost matplotlib scikit-learn
+2. File Placement:
+   Place this script and the three '.txt' files in the SAME directory.
+3. Execution:
+   $ python your_script_name.py
+================================================================================
+"""
+
+import pandas as pd
+import numpy as np
+import shap
+import xgboost as xgb
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import GridSearchCV, KFold
+from matplotlib.patches import Patch
+
+# --- Configure Plotting Style for Academic Publication ---
+plt.rcParams['font.sans-serif'] = ['Arial']
+plt.rcParams['axes.unicode_minus'] = False 
+
+# --- Global Definitions ---
+SEASON_FILES = {"Spring": "data_spring.txt", "Summer": "data_summer.txt", "Autumn": "data_autumn.txt"}
+COLS_IN_TXT = ['TA', 'TH', 'NEE', 'CH4', 'DOC', 'DIC']
+FEATURES = ['TA', 'TH']
+TARGETS = ['NEE', 'CH4', 'DOC', 'DIC']
+
+# Scientific Display Names
+SEASON_DISPLAY = {"Spring": "Spring", "Summer": "Summer", "Autumn": "Fall"}
+TARGET_DISPLAY = {'NEE': 'NEE', 'CH4': r'F$_{\mathrm{CH_4}}$', 'DOC': r'F$_{\mathrm{DOC}}$', 'DIC': r'F$_{\mathrm{DIC}}$'}
+
+class CarbonDiagnosticPipeline:
+    def __init__(self):
+        self.raw_dfs = {}
+        self.scaler_x = MinMaxScaler()
+        self.scaler_y = MinMaxScaler()
+        self.shap_plot_data = []
+        self.mean_importance_map = {}
+
+    def prepare_data(self):
+        """Unified normalization across all seasons (Global Scaling)."""
+        all_combined = []
+        print("\n[1/4] Step 1: Loading Data and Global Scaling...")
+        
+        for season, filename in SEASON_FILES.items():
+            try:
+                df = pd.read_csv(filename, sep=None, engine='python', header=None)
+                df.columns = COLS_IN_TXT
+                df['Season'] = season
+                all_combined.append(df)
+                self.raw_dfs[season] = df
+                print(f"SUCCESS: Loaded {filename} for {season}.")
+            except Exception:
+                print("!" * 60)
+                print(f"WARNING: '{filename}' NOT FOUND!")
+                print(f"ACTION: Generating RANDOM TEMPLATE DATA for {season} to test pipeline.")
+                print("!" * 60)
+                dummy = pd.DataFrame(np.random.rand(200, 6), columns=COLS_IN_TXT)
+                dummy['Season'] = season
+                all_combined.append(dummy)
+                self.raw_dfs[season] = dummy
+
+        full_data = pd.concat(all_combined)
+        self.scaler_x.fit(full_data[FEATURES])
+        self.scaler_y.fit(full_data[TARGETS])
+
+    def run_analysis(self):
+        """XGBoost with 5-fold CV and SHAP attribution."""
+        print("\n[2/4] Step 2: Training XGBoost with 5-fold CV & SHAP Diagnostic...")
+        
+        # Strictly maintain order: Target -> Season -> Feature
+        # Each combination becomes a unique sector in the polar plot
+        for target in TARGETS:
+            for season_key in ["Spring", "Summer", "Autumn"]:
+                data = self.raw_dfs[season_key]
+                X_scaled = pd.DataFrame(self.scaler_x.transform(data[FEATURES]), columns=FEATURES)
+                y_scaled = self.scaler_y.transform(data[TARGETS])[:, TARGETS.index(target)]
+
+                # 5-fold Cross-Validation for Hyperparameter Search
+                kf = KFold(n_splits=5, shuffle=True, random_state=42)
+                param_grid = {'max_depth': [3, 4], 'learning_rate': [0.1]}
+                
+                grid = GridSearchCV(
+                    estimator=xgb.XGBRegressor(n_estimators=100, objective='reg:squarederror'), 
+                    param_grid=param_grid, cv=kf, scoring='neg_mean_squared_error'
+                )
+                grid.fit(X_scaled, y_scaled)
+                
+                explainer = shap.Explainer(grid.best_estimator_)
+                shap_values = explainer(X_scaled)
+
+                for i, feat in enumerate(FEATURES):
+                    m_abs = np.mean(np.abs(shap_values[:, i].values))
+                    
+                    # Construct unique label per sector (e.g., 'Spring:\nNEE-TA')
+                    theta_label = f"{SEASON_DISPLAY[season_key]}:\n{TARGET_DISPLAY[target]}-{feat}"
+                    self.mean_importance_map[theta_label] = {"value": m_abs, "type": feat}
+                    
+                    # Store scatter points
+                    for val, fv in zip(shap_values[:, i].values.flatten(), X_scaled[feat].values):
+                        self.shap_plot_data.append({
+                            "theta": theta_label, "shap_value": val, "feature_intensity": fv
+                        })
+
+    def plot_results(self):
+        """Generates the polar plot. Geometry fixed to prevent bar overlap."""
+        print("\n[3/4] Step 3: Generating Polar Diagnostic Plots...")
+        df = pd.DataFrame(self.shap_plot_data)
+        categories = df['theta'].unique()
+        N = len(categories)
+        angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
+
+        fig, ax = plt.subplots(figsize=(12, 12), subplot_kw={'projection': 'polar'})
+        ax.set_theta_offset(np.pi / 2)
+        ax.set_theta_direction(-1)
+
+        cmap = plt.get_cmap('coolwarm')
+        # Radial Mapping Logic: SHAP [-0.4, 0.6] -> Radial [0, 1.6]
+        r_func = lambda x: (x + 0.4) / 1.0 * 1.6 
+        zero_r = r_func(0)
+        
+        # Bar width set to 60% of sector width to ensure clear separation
+        bar_width = (2 * np.pi / N) * 0.6
+        
+        for i, cat in enumerate(categories):
+            sub = df[df['theta'] == cat]
+            angle = angles[i]
+
+            # 1. Scatter SHAP distribution (zorder 1)
+            # Normal distribution jitter around the center angle of the sector
+            ax.scatter(np.random.normal(angle, 0.02, len(sub)), r_func(sub['shap_value']), 
+                       c=sub['feature_intensity'], cmap=cmap, s=20, alpha=0.7, zorder=1)
+
+            # 2. Draw a SINGLE Mean importance bar per category (zorder 3)
+            # Since each 'cat' is unique (e.g., ...-TA or ...-TH), they occupy their own angle.
+            info = self.mean_importance_map[cat]
+            bar_color = 'lightcoral' if info['type'] == 'TA' else 'skyblue'
+            bar_height = info['value'] * 1.6 # Radial scale factor
+            
+            ax.bar(angle, bar_height, width=bar_width, bottom=zero_r, facecolor='none', 
+                   edgecolor=bar_color, linewidth=3, alpha=0.9, zorder=3)
+
+        ax.set_xticks(angles)
+        ax.set_xticklabels(categories, fontsize=10)
+        ax.set_rlim(0, 1.8)
+        
+        # Colorbar and Academic Legend
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, 1))
+        cbar = plt.colorbar(sm, ax=ax, shrink=0.3, pad=0.1)
+        cbar.set_label('Feature Intensity (Normalized)', fontsize=12)
+        
+        legend_elements = [
+            Patch(facecolor='none', edgecolor='lightcoral', linewidth=3, label='Mean Importance: TA'),
+            Patch(facecolor='none', edgecolor='skyblue', linewidth=3, label='Mean Importance: TH')
+        ]
+        ax.legend(handles=legend_elements, loc='upper right', bbox_to_anchor=(1.3, 1.1))
+
+        print("\n[4/4] Step 4: Finalizing Output...")
+        plt.tight_layout()
+        plt.savefig('SHAP_Diagnostic_Final.pdf', format='pdf', dpi=300)
+        print("Done. Results saved as 'SHAP_Diagnostic_Final.pdf'.")
+        plt.show()
+
+if __name__ == "__main__":
+    pipeline = CarbonDiagnosticPipeline()
+    pipeline.prepare_data()
+    pipeline.run_analysis()
+    pipeline.plot_results()
