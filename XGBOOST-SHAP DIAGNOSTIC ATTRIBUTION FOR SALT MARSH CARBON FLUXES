@@ -1,0 +1,173 @@
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+XGBOOST-SHAP DIAGNOSTIC ATTRIBUTION FOR SALT MARSH CARBON FLUXES
+================================================================================
+[DATA ACCESSIBILITY AND POLICY COMPLIANCE]
+Due to institutional environmental data protection policies, specific 
+time-series for driving factors (Air Temperature, TA; Tidal Height, TH) are 
+restricted from public redistribution. However, the carbon flux sequences 
+(NEE, FCH4, FDOC, FDIC) analyzed in this study are available at 
+[https://github.com/aa598444221/v1] for scientific verification.
+
+[DATA PREPARATION AND FALLBACK MECHANISM]
+This script includes a 'dummy data' fallback. If the local environment 
+cannot locate the '.txt' data files, it automatically generates 
+synthetic data to demonstrate the computational pipeline. 
+================================================================================
+"""
+
+import pandas as pd
+import numpy as np
+import shap
+import xgboost as xgb
+import matplotlib.pyplot as plt
+from scipy import stats
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import GridSearchCV, KFold, train_test_split
+from sklearn.metrics import r2_score, mean_squared_error
+from matplotlib.patches import Patch
+
+# Academic Plotting Configuration
+plt.rcParams['font.sans-serif'] = ['Arial']
+plt.rcParams['axes.unicode_minus'] = False 
+
+# Metadata and Constants
+SEASON_FILES = {"Spring": "data_spring.txt", "Summer": "data_summer.txt", "Autumn": "data_autumn.txt"}
+COLS_IN_TXT = ['TA', 'TH', 'NEE', 'CH4', 'DOC', 'DIC']
+FEATURES = ['TA', 'TH']
+TARGETS = ['NEE', 'CH4', 'DOC', 'DIC']
+SEASON_DISPLAY = {"Spring": "Spring", "Summer": "Summer", "Autumn": "Fall"}
+TARGET_DISPLAY = {'NEE': 'NEE', 'CH4': r'F$_{\mathrm{CH_4}}$', 'DOC': r'F$_{\mathrm{DOC}}$', 'DIC': r'F$_{\mathrm{DIC}}$'}
+
+class CarbonFluxDiagnostic:
+    def __init__(self, seed=42):
+        self.seed = seed
+        self.raw_data = {}
+        self.scaler_x = MinMaxScaler()
+        self.scaler_y = MinMaxScaler()
+        self.shap_records = []
+        self.importance_metrics = {}
+
+    def prepare_datasets(self):
+        """Standardized ingestion with policy-compliant fallback."""
+        buffer = []
+        for season, path in SEASON_FILES.items():
+            try:
+                df = pd.read_csv(path, sep=None, engine='python', header=None)
+                df.columns = COLS_IN_TXT
+            except Exception:
+                df = pd.DataFrame(np.random.rand(200, 6), columns=COLS_IN_TXT)
+            
+            df['Season'] = season
+            buffer.append(df)
+            self.raw_data[season] = df
+
+        full_pool = pd.concat(buffer)
+        self.scaler_x.fit(full_pool[FEATURES])
+        self.scaler_y.fit(full_pool[TARGETS])
+
+    def run_nested_modeling(self):
+        """XGBoost optimization with R2, RMSE, and P-value validation."""
+        for target in TARGETS:
+            t_idx = TARGETS.index(target)
+            for s_key in ["Spring", "Summer", "Autumn"]:
+                df_s = self.raw_data[s_key]
+                X = pd.DataFrame(self.scaler_x.transform(df_s[FEATURES]), columns=FEATURES)
+                y = self.scaler_y.transform(df_s[TARGETS])[:, t_idx]
+
+                # 70/30 Hold-out Validation
+                X_train, X_test, y_train, y_test = train_test_split(
+                    X, y, test_size=0.30, random_state=self.seed
+                )
+
+                # Parameter Grid for Rigorous Tuning
+                param_grid = {
+                    'max_depth': [3, 4, 5],
+                    'learning_rate': [0.01, 0.05, 0.1],
+                    'subsample': [0.8, 1.0],
+                    'n_estimators': [100, 200]
+                }
+                
+                grid = GridSearchCV(
+                    estimator=xgb.XGBRegressor(objective='reg:squarederror', random_state=self.seed),
+                    param_grid=param_grid,
+                    cv=KFold(n_splits=5, shuffle=True, random_state=self.seed),
+                    scoring='neg_mean_squared_error',
+                    n_jobs=-1
+                )
+                grid.fit(X_train, y_train)
+                model = grid.best_estimator_
+
+                # --- Statistical Validation Layer ---
+                y_pred = model.predict(X_test)
+                r2 = r2_score(y_test, y_pred)
+                rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+                
+                # Calculate P-value for the regression (Observed vs Predicted)
+                slope, intercept, r_val, p_val, std_err = stats.linregress(y_test, y_pred)
+                
+                # Scientific Logging
+                status = "Significant" if p_val < 0.01 else "Non-Significant"
+                print(f"[{s_key}-{target}] R2: {r2:.3f} | RMSE: {rmse:.4f} | P: {p_val:.2e} ({status})")
+
+                # SHAP Attribution (Full Dataset for Stability)
+                explainer = shap.Explainer(model)
+                shap_vals = explainer(X)
+
+                for i, f_name in enumerate(FEATURES):
+                    m_imp = np.mean(np.abs(shap_vals[:, i].values))
+                    lbl = f"{SEASON_DISPLAY[s_key]}:\n{TARGET_DISPLAY[target]}-{f_name}"
+                    self.importance_metrics[lbl] = {"val": m_imp, "feat": f_name}
+                    
+                    for sv, fv in zip(shap_vals[:, i].values.flatten(), X[f_name].values):
+                        self.shap_records.append({"theta": lbl, "shap": sv, "feat_val": fv})
+
+    def plot_attribution_geometry(self):
+        """Polar projection of feature impact distributions."""
+        df_p = pd.DataFrame(self.shap_records)
+        cats = df_p['theta'].unique()
+        N = len(cats)
+        angles = np.linspace(0, 2 * np.pi, N, endpoint=False)
+
+        fig, ax = plt.subplots(figsize=(12, 12), subplot_kw={'projection': 'polar'})
+        ax.set_theta_offset(np.pi / 2)
+        ax.set_theta_direction(-1)
+
+        r_scale = lambda x: (x + 0.4) / 1.0 * 1.6 
+        base_r = r_scale(0)
+        width = (2 * np.pi / N) * 0.6
+        cmap = plt.get_cmap('coolwarm')
+        
+        for i, cat in enumerate(cats):
+            sub = df_p[df_p['theta'] == cat]
+            ang = angles[i]
+            ax.scatter(np.random.normal(ang, 0.02, len(sub)), r_scale(sub['shap']), 
+                       c=sub['feat_val'], cmap=cmap, s=20, alpha=0.7, zorder=2)
+
+            meta = self.importance_metrics[cat]
+            color = '#e74c3c' if meta['feat'] == 'TA' else '#3498db'
+            ax.bar(ang, meta['val'] * 1.6, width=width, bottom=base_r, 
+                   facecolor='none', edgecolor=color, linewidth=2, zorder=3)
+
+        ax.set_xticks(angles)
+        ax.set_xticklabels(cats, fontsize=9)
+        ax.set_rlim(0, 1.8)
+        
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=plt.Normalize(0, 1))
+        cb = plt.colorbar(sm, ax=ax, shrink=0.3, pad=0.1)
+        cb.set_label('Feature Intensity (Normalized)')
+        
+        leg = [Patch(facecolor='none', edgecolor='#e74c3c', linewidth=2, label='Mean Importance: TA'),
+               Patch(facecolor='none', edgecolor='#3498db', linewidth=2, label='Mean Importance: TH')]
+        ax.legend(handles=leg, loc='upper right', bbox_to_anchor=(1.2, 1.1), frameon=False)
+
+        plt.tight_layout()
+        plt.savefig('Carbon_Flux_SHAP_Diagnostic.pdf', dpi=300)
+        plt.show()
+
+if __name__ == "__main__":
+    analysis = CarbonFluxDiagnostic(seed=42)
+    analysis.prepare_datasets()
+    analysis.run_nested_modeling()
+    analysis.plot_attribution_geometry()
